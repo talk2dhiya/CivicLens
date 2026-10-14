@@ -55,8 +55,8 @@ Use the existing setup where possible.
 -   **API communication:** HTTP requests using `fetch` or the existing
     request library
 -   **Image uploads:** Multipart form upload with server-side validation
--   **Maps:** Leaflet with OpenStreetMap tiles if the project does not
-    already have a map solution
+-   **Maps:** Leaflet with OpenStreetMap tiles (`leaflet`, `react-leaflet`, `leaflet.markercluster`)
+-   **Hotspot Analysis:** Separate backend analytics service using `scikit-learn` DBSCAN with Haversine distance metric
 -   **AI integration:** Separate service/adapter boundary for the
     teammate's model, after its interface is agreed
 -   **Testing:** Backend endpoint tests and manual end-to-end frontend
@@ -166,10 +166,21 @@ existing work.
 -   `POST /api/v1/reports/{report_id}/resolution-evidence` --- optional
     later endpoint for resolution note/photo.
 
-### Map and statistics
+### Map and Hotspot Analytics
 
--   `GET /api/v1/map/reports` --- return map-safe report fields and
-    coordinates for issues with valid coordinates.
+-   `GET /api/v1/map/reports` --- return map-safe report fields (id, category, status, location_text, latitude, longitude, created_at, image_url) for issues having valid coordinates. Handles empty results gracefully.
+-   `GET /api/v1/analytics/hotspots` --- execute DBSCAN clustering on geolocated reports:
+    -   **Query Parameters:**
+        -   `category` (optional: filter by issue category)
+        -   `status` (optional: filter by report status)
+        -   `time_range` (optional: preset intervals `7d`, `30d`, `90d`, `all`; default `all`)
+        -   `eps_meters` (optional: DBSCAN epsilon distance threshold in meters; default 500.0)
+        -   `min_samples` (optional: minimum points to form a cluster; default 3)
+    -   **Response Schema:**
+        -   `hotspots`: list of cluster objects, each with `id`, representative `centroid` (`latitude`, `longitude`), `radius_meters`, `report_count`, `category_breakdown`, `status_breakdown`, and `report_ids`.
+        -   `noise_reports`: list of isolated reports not belonging to any cluster (retained and distinguished, never silently dropped).
+        -   `parameters_used`: metadata of parameters applied.
+        -   `disclaimer`: "Hotspots indicate concentrations of submitted citizen reports, not verified ground danger, severity, or future risk."
 -   `GET /api/v1/statistics/summary` --- status/category counts for
     dashboards.
 
@@ -250,18 +261,43 @@ duplicates. Grouping decisions should be traceable.
 -   Do not expose arbitrary filesystem paths.
 -   A photo is compulsory for all reports to enable issue verification and computer vision recognition.
 
-## 10. Location and Map
+## 10. Location, Map, and Geographic Hotspot Clustering
 
--   Support human-readable location from the beginning.
--   Add latitude/longitude for map plotting.
--   Never invent coordinates when only text location is provided.
--   Reports without coordinates must still work in list/details pages.
--   Use Leaflet/OpenStreetMap if appropriate for the existing stack.
--   Keep map popups concise and link to issue details.
--   Avoid exposing a citizen's precise personal location. Record the
-    reported public issue location, not the user's home/live location.
--   Follow the map tile provider's usage policy; do not assume unlimited
-    free production usage.
+### Location Storage & Map Display
+-   Support human-readable location from the beginning (`location_text`).
+-   Add `latitude` and `longitude` for map plotting. Never invent coordinates when only text location is provided.
+-   Reports without coordinates must still work seamlessly in list/details views and must be excluded from map layers without raising errors.
+-   **Configurable Map Center & Bounds**: 
+    -   Fit map bounds dynamically to the bounding box of valid report coordinates.
+    -   If no valid coordinates exist yet (sparse or empty dataset), fall back gracefully to a configurable default service area placeholder (Vellore, Tamil Nadu: `[12.9165, 79.1325]`, default zoom `12`), overridable via environment variables (`VITE_MAP_CENTER_LAT`, `VITE_MAP_CENTER_LNG`, `VITE_MAP_DEFAULT_ZOOM`).
+    -   Never hardcode fixed coordinates across UI components.
+-   **Marker Clustering**:
+    -   Support individual report pins at street/neighborhood zoom levels.
+    -   Group nearby pins into marker clusters with counts at city/regional zoom levels using Leaflet marker clustering.
+    -   Selecting a marker opens an interactive popup with report title, status, thumbnail, and link to full report details.
+-   Avoid exposing a citizen's precise personal identity or live location. Record public issue coordinates only.
+-   Follow OpenStreetMap / tile provider usage policies.
+
+### Geographic Hotspot Clustering (DBSCAN)
+-   **Architecture Isolation**: Implement hotspot clustering as a separate, dedicated backend analytics service (`backend/services/hotspots.py`), completely decoupled from the road-damage computer vision model.
+-   **Clustering Algorithm & Distance Calculation**:
+    -   Use Density-Based Spatial Clustering of Applications with Noise (**DBSCAN**) via `scikit-learn`.
+    -   Use the **Haversine metric** for geographic distance on spherical Earth: convert coordinates $(\text{lat}, \text{lng})$ from degrees to radians; compute $\epsilon_{\text{rad}} = \frac{\text{eps\_meters}}{6,371,000}$.
+    -   Default parameters: `eps_meters = 500.0` (cluster radius threshold of 500 meters), `min_samples = 3` (minimum 3 reports required to constitute a hotspot).
+    -   Both parameters must be configurable via API query parameters and backend defaults.
+-   **Filtering Support**:
+    -   Hotspot analysis must support filtering by `category`, `status`, and `time_range` (`7d`, `30d`, `90d`, `all`).
+    -   Time filtering must query the report `created_at` timestamp against UTC now.
+-   **Output & Cluster Representation**:
+    -   Return structured cluster objects containing: unique cluster ID, representative centroid $(\text{lat}, \text{lng})$, bounding radius in meters, report count, breakdown by category, breakdown by status, and IDs of contributing reports.
+    -   **Preserve Isolated Reports**: Reports classified as noise ($\text{label} = -1$) must **not** be discarded; return them separately as `noise_reports` so isolated issues remain visible.
+-   **Frontend Visualization Layer**:
+    -   Display hotspots on the map as a **distinct visual layer**, separate from standard marker clustering.
+    -   Render as a translucent circular boundary around the centroid (radius matching cluster spread or $\epsilon$) plus an eye-catching hotspot badge.
+    -   Clicking a hotspot opens a summary card showing total complaints, category breakdown, status distribution, and an inspectable list of contributing report links.
+-   **Transparency & Disclaimer**:
+    -   Every hotspot API response and map visualizer must clearly display the disclaimer: *"Hotspots indicate concentrations of submitted citizen reports, not verified ground danger, severity, or future risk."*
+    -   Gracefully handle zero coordinates or sparse reports without fabricating clusters or coordinates.
 
 ## 11. Frontend Quality
 
@@ -406,13 +442,37 @@ Acceptance: - Invalid transitions are rejected. - History persists and
 is visible where appropriate. - Updates change the report status and
 timestamp.
 
-### Phase 4 --- Map
+### Phase 4 --- Interactive Map & Geographic Hotspot Clustering
 
-Tasks: - Add coordinate support. - Build map using Leaflet/OpenStreetMap
-if suitable. - Plot only reports with valid coordinates.
+#### 4.1 Backend Map & DBSCAN Hotspot Service
+-   **Tasks:**
+    -   Implement dedicated analytics service `backend/services/hotspots.py`, independent of the road-damage ML model.
+    -   Apply DBSCAN from `scikit-learn` using the Haversine metric ($\text{lat}/\text{lng}$ in radians, $\epsilon_{\text{rad}} = \text{eps\_meters} / 6,371,000$).
+    -   Provide configurable defaults: `eps_meters = 500.0`, `min_samples = 3`.
+    -   Support query filters: `category`, `status`, and `time_range` (`7d`, `30d`, `90d`, `all`).
+    -   Calculate cluster centroids, bounding radii, report counts, category breakdown, status breakdown, and contributing report IDs.
+    -   Preserve isolated reports as `noise_reports` rather than discarding them.
+    -   Expose endpoints: `GET /api/v1/map/reports` and `GET /api/v1/analytics/hotspots`.
+    -   Include mandatory transparency disclaimer on all hotspot responses.
+    -   Add automated backend unit tests using synthetic coordinates (known clusters, known noise, category/time filter changes, and empty dataset handling).
+-   **Acceptance:**
+    -   Unit tests pass reliably on synthetic coordinates.
+    -   Filters dynamically adjust clustering outcomes.
+    -   Reports without coordinates or sparse inputs return clean, valid responses without 500 errors.
 
-Acceptance: - Pins match stored reports. - Reports without coordinates
-remain accessible. - Selecting a pin opens the correct report.
+#### 4.2 Frontend Interactive Map & Hotspot Visualizer
+-   **Tasks:**
+    -   Add Leaflet and OpenStreetMap (`leaflet`, `react-leaflet`, `leaflet.markercluster`) in a dedicated "Map" tab.
+    -   Support dynamic bounding box fitting to valid report coordinates; gracefully fall back to configurable city placeholder (Vellore: `[12.9165, 79.1325]`, default zoom 12) via environment variables (`VITE_MAP_CENTER_LAT`, `VITE_MAP_CENTER_LNG`, `VITE_MAP_DEFAULT_ZOOM`).
+    -   Render standard report pins with marker clustering at broader zoom levels. Clicking a pin opens a preview card linked to full report details.
+    -   Render hotspots as a distinct visual layer (translucent circular boundary around cluster centroid + hotspot marker/badge).
+    -   Clicking a hotspot opens an inspection card with report count, category breakdown, status breakdown, and links to contributing reports.
+    -   Prominently display the hotspot disclaimer in the map UI.
+-   **Acceptance:**
+    -   Map loads OpenStreetMap tiles correctly without layout distortion.
+    -   Marker clusters group and ungroup reliably across zoom levels.
+    -   Hotspot layer clearly differentiates clusters from ordinary markers.
+    -   Empty or zero-coordinate states display informative placeholders without breaking.
 
 ### Phase 5 --- Authentication and roles
 
@@ -443,14 +503,14 @@ Acceptance: - Model output follows the agreed schema. - Manual reporting
 still works if model is unavailable. - Evaluation and limitations are
 documented.
 
-### Phase 8 --- Duplicate suggestions, priority, analytics
+### Phase 8 --- Duplicate suggestions, priority, and advanced predictive analytics
 
-Tasks: - Add traceable duplicate suggestions/grouping. - Add explainable
-prioritization if justified. - Add hotspot analysis and prediction only
-when supported by data.
+Tasks: - Add traceable duplicate suggestions/grouping (text similarity + spatial proximity). - Add explainable
+prioritization if justified. - Add advanced predictive trend modeling only
+when supported by sufficient historical resolution data.
 
 Acceptance: - Original reports are preserved. - Scores/suggestions have
-documented meaning. - Analytics use real data and state limitations.
+documented meaning. - Predictive analytics use real data and state limitations.
 
 ### Phase 9 --- Final integration and documentation
 
@@ -465,16 +525,30 @@ No Git push or commit unless explicitly requested.
 
 ## 17. Minimum Testing Checklist
 
-Test at least: - Backend starts. - Frontend starts. - Health endpoint
-responds. - Valid report submission succeeds. - Missing required fields
-are rejected. - Unsupported categories are rejected. - Oversized/invalid
-images are rejected. - Reports persist after backend restart. -
-List/detail endpoints return correct data. - Invalid report IDs return a
-suitable not-found response. - Filters return expected reports. -
-Invalid status values/transitions are rejected. - Unauthorized users
-cannot perform protected actions after auth is implemented. - Reports
-without coordinates do not break the map. - Frontend displays API errors
-clearly. - Existing working routes and screens still function.
+Test at least:
+-   Backend starts.
+-   Frontend starts.
+-   Health endpoint responds.
+-   Valid report submission succeeds.
+-   Missing required fields (e.g. photo) are rejected.
+-   Unsupported categories are rejected.
+-   Oversized/invalid images are rejected.
+-   Reports persist after backend restart.
+-   List/detail endpoints return correct data.
+-   Invalid report IDs return a suitable not-found response.
+-   Filters return expected reports.
+-   Invalid status values/transitions are rejected.
+-   Unauthorized users cannot perform protected actions after auth is implemented.
+-   Reports without coordinates do not break the map or clustering services.
+-   **Hotspot clustering with synthetic coordinates**:
+    -   Identifies known dense clusters and separates isolated noise points.
+    -   Dynamically updates when category filter is applied.
+    -   Dynamically updates when status filter is applied.
+    -   Dynamically updates when time range filter is changed.
+    -   Handles empty database and zero-coordinate datasets gracefully without crashing.
+    -   Rejects invalid parameter values (e.g., negative `eps` or non-integer `min_samples`) with clean 400 errors.
+-   Frontend displays API errors clearly.
+-   Existing working routes and screens still function.
 
 Use automated tests where practical, plus manual end-to-end checks.
 

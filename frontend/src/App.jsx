@@ -1,4 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import LocationPickerMap from './components/LocationPickerMap'
+import CivicMapExplorer from './components/CivicMapExplorer'
+import AuthPage from './components/AuthPage'
+import AdminPanel from './components/AdminPanel'
+import AuthorityDashboard from './components/AuthorityDashboard'
+import ResolutionEvidenceModal from './components/ResolutionEvidenceModal'
+import Sidebar from './components/Sidebar'
+import TopBar from './components/TopBar'
 
 const CATEGORIES = [
   'Road Damage / Potholes',
@@ -50,14 +58,30 @@ function formatDate(isoString) {
 }
 
 function App() {
-  const [activeTab, setActiveTab] = useState('browse') // 'report' | 'browse'
+  const [activeTab, setActiveTab] = useState('browse') // 'browse' | 'map' | 'report' | 'authority' | 'admin'
   const [backendStatus, setBackendStatus] = useState('checking')
+
+  // Authentication State
+  const [token, setToken] = useState(() => localStorage.getItem('civiclens_token') || '')
+  const [currentUser, setCurrentUser] = useState(() => {
+    const saved = localStorage.getItem('civiclens_user')
+    if (saved) {
+      try {
+        return JSON.parse(saved)
+      } catch {
+        return null
+      }
+    }
+    return null
+  })
+  const [myReportsOnly, setMyReportsOnly] = useState(false)
 
   // Selected report for Details Full-View
   const [selectedReportId, setSelectedReportId] = useState(null)
   const [detailReport, setDetailReport] = useState(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [detailError, setDetailError] = useState('')
+  const [detailResolutionModalOpen, setDetailResolutionModalOpen] = useState(false)
 
   // Authority Status Update state
   const [selectedNextStatus, setSelectedNextStatus] = useState('')
@@ -98,17 +122,64 @@ function App() {
       .catch(() => setBackendStatus('offline'))
   }, [])
 
-  // Fetch reports list with active filters
+  // Verify active JWT token on mount or token change
+  useEffect(() => {
+    if (token) {
+      fetch('/api/v1/auth/me', {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+        .then((res) => {
+          if (!res.ok) {
+            // Expired or invalid token
+            setToken('')
+            setCurrentUser(null)
+            localStorage.removeItem('civiclens_token')
+            localStorage.removeItem('civiclens_user')
+          } else {
+            return res.json()
+          }
+        })
+        .then((data) => {
+          if (data && data.user) {
+            setCurrentUser(data.user)
+            localStorage.setItem('civiclens_user', JSON.stringify(data.user))
+          }
+        })
+        .catch(() => {})
+    }
+  }, [token])
+
+  const handleLogout = () => {
+    setToken('')
+    setCurrentUser(null)
+    setMyReportsOnly(false)
+    localStorage.removeItem('civiclens_token')
+    localStorage.removeItem('civiclens_user')
+    if (activeTab === 'admin') {
+      setActiveTab('browse')
+    }
+  }
+
+  // Fetch reports list with active filters or My Reports toggle
   const fetchReports = useCallback(async () => {
     setLoadingReports(true)
     setReportsError('')
     try {
-      const params = new URLSearchParams()
-      if (filterCategory !== 'ALL') params.append('category', filterCategory)
-      if (filterStatus !== 'ALL') params.append('status', filterStatus)
-      if (filterSearch.trim()) params.append('search', filterSearch.trim())
+      let url = '/api/v1/reports'
+      const headers = {}
 
-      const res = await fetch(`/api/v1/reports?${params.toString()}`)
+      if (myReportsOnly && token) {
+        url = '/api/v1/reports/my'
+        headers['Authorization'] = `Bearer ${token}`
+      } else {
+        const params = new URLSearchParams()
+        if (filterCategory !== 'ALL') params.append('category', filterCategory)
+        if (filterStatus !== 'ALL') params.append('status', filterStatus)
+        if (filterSearch.trim()) params.append('search', filterSearch.trim())
+        url = `/api/v1/reports?${params.toString()}`
+      }
+
+      const res = await fetch(url, { headers })
       if (!res.ok) throw new Error('Failed to load reports from server.')
       const data = await res.json()
       setReports(data.reports || [])
@@ -117,7 +188,7 @@ function App() {
     } finally {
       setLoadingReports(false)
     }
-  }, [filterCategory, filterStatus, filterSearch])
+  }, [filterCategory, filterStatus, filterSearch, myReportsOnly, token])
 
   useEffect(() => {
     if (activeTab === 'browse' && selectedReportId === null) {
@@ -163,6 +234,11 @@ function App() {
       return
     }
 
+    if (selectedNextStatus === 'Resolved') {
+      setDetailResolutionModalOpen(true)
+      return
+    }
+
     if (
       selectedNextStatus === 'Rejected' &&
       (!statusNote.trim() || statusNote.trim().length < 5)
@@ -175,9 +251,12 @@ function App() {
 
     setUpdatingStatus(true)
     try {
+      const headers = { 'Content-Type': 'application/json' }
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
       const res = await fetch(`/api/v1/reports/${detailReport.id}/status`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({
           status: selectedNextStatus,
           note: statusNote.trim() || null,
@@ -228,7 +307,7 @@ function App() {
   const handleImageChange = (e) => {
     const file = e.target.files[0]
     if (!file) return
-
+ 
     if (file.size > 5 * 1024 * 1024) {
       alert('Image file size must be less than 5MB.')
       e.target.value = ''
@@ -261,12 +340,19 @@ function App() {
     setFilterCategory('ALL')
     setFilterStatus('ALL')
     setFilterSearch('')
+    setMyReportsOnly(false)
   }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setSubmitError('')
     setSuccessReport(null)
+
+    if (!token || !currentUser) {
+      setSubmitError('You must sign in as a citizen or administrator to submit a report.')
+      setActiveTab('auth')
+      return
+    }
 
     if (!selectedImage) {
       setSubmitError('Photo attachment is compulsory for reporting an issue.')
@@ -294,8 +380,12 @@ function App() {
     setSubmitting(true)
 
     try {
+      const headers = {}
+      if (token) headers['Authorization'] = `Bearer ${token}`
+
       const response = await fetch('/api/v1/reports', {
         method: 'POST',
+        headers,
         body: formData,
       })
 
@@ -313,58 +403,48 @@ function App() {
     }
   }
 
-  return (
-    <div className="container">
-      {/* Header */}
-      <div className="card">
-        <div className="header">
-          <h1>CivicLens</h1>
-          <p>AI-Powered Neighborhood Intelligence &amp; Response Platform</p>
-          <span
-            className={`badge ${
-              backendStatus === 'online' ? 'badge-online' : 'badge-offline'
-            }`}
-          >
-            {backendStatus === 'online'
-              ? '● Backend Online'
-              : backendStatus === 'checking'
-              ? 'Checking API...'
-              : '○ Backend Offline (Start Server)'}
-          </span>
-        </div>
+  if (activeTab === 'auth') {
+    return (
+      <AuthPage
+        onAuthSuccess={(user, tok) => {
+          setCurrentUser(user)
+          setToken(tok)
+          setActiveTab('browse')
+        }}
+        onBack={() => setActiveTab('browse')}
+      />
+    )
+  }
 
-        {/* Tab Switcher */}
-        <div className="nav-tabs">
-          <button
-            className={`tab-btn ${activeTab === 'browse' ? 'active' : ''}`}
-            onClick={() => {
-              setActiveTab('browse')
-              setSelectedReportId(null)
-            }}
-          >
-            📋 Browse Reports
-          </button>
-          <button
-            className={`tab-btn ${activeTab === 'report' ? 'active' : ''}`}
-            onClick={() => {
-              setActiveTab('report')
-              setSelectedReportId(null)
-            }}
-          >
-            ➕ Report an Issue
-          </button>
-        </div>
-      </div>
+  return (
+    <div className="app-layout">
+      <Sidebar
+        activeTab={activeTab}
+        onSelectTab={(tab) => {
+          setActiveTab(tab)
+          setSelectedReportId(null)
+        }}
+        currentUser={currentUser}
+      />
+      <div className="app-main-content">
+        <TopBar
+          currentUser={currentUser}
+          backendStatus={backendStatus}
+          onOpenAuth={() => setActiveTab('auth')}
+          onLogout={handleLogout}
+        />
+        <main className="app-page-body">
 
       {/* VIEW 1: Full Report Details Transition */}
       {selectedReportId !== null ? (
-        <div className="card details-view">
-          <div className="details-header">
+        <div className="details-view-container">
+          <div className="details-nav-bar">
             <button
-              className="btn btn-secondary"
+              type="button"
+              className="details-back-btn"
               onClick={() => setSelectedReportId(null)}
             >
-              ← Back to Reports
+              Back to Reports
             </button>
             {detailReport && (
               <span className={`status-badge ${getStatusClass(detailReport.status)}`}>
@@ -374,8 +454,7 @@ function App() {
           </div>
 
           {loadingDetail && (
-            <div className="empty-state">
-              <div className="empty-state-icon">⏳</div>
+            <div className="feed-empty">
               <h3>Loading report details...</h3>
             </div>
           )}
@@ -384,7 +463,8 @@ function App() {
             <div className="alert alert-error">
               {detailError}
               <button
-                className="btn btn-secondary"
+                type="button"
+                className="details-back-btn"
                 style={{ marginLeft: '12px' }}
                 onClick={() => setSelectedReportId(null)}
               >
@@ -395,75 +475,113 @@ function App() {
 
           {detailReport && !loadingDetail && (
             <div>
-              <h2 style={{ margin: '0 0 16px 0', fontSize: '22px', color: '#111827' }}>
-                {detailReport.category}
-              </h2>
-
-              {detailReport.image_path ? (
-                <img
-                  src={detailReport.image_path}
-                  alt={detailReport.category}
-                  className="details-image-full"
-                />
-              ) : (
-                <div
-                  style={{
-                    background: '#f3f4f6',
-                    height: '180px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    borderRadius: '8px',
-                    color: '#6b7280',
-                    marginBottom: '20px',
-                  }}
-                >
-                  No photo available
-                </div>
-              )}
-
-              <div className="details-grid">
-                <div className="details-info-item">
-                  <div className="details-info-label">Report ID</div>
-                  <div className="details-info-val">#{detailReport.id}</div>
-                </div>
-
-                <div className="details-info-item">
-                  <div className="details-info-label">Date Submitted</div>
-                  <div className="details-info-val">
-                    {formatDate(detailReport.created_at)}
-                  </div>
-                </div>
-
-                <div className="details-info-item" style={{ gridColumn: '1 / -1' }}>
-                  <div className="details-info-label">Location</div>
-                  <div className="details-info-val">
-                    📍 {detailReport.location_text}
-                  </div>
-                  {detailReport.latitude !== null && detailReport.longitude !== null && (
-                    <div style={{ marginTop: '8px' }}>
-                      <span className="coords-pill">
-                        GPS Coordinates: {detailReport.latitude}, {detailReport.longitude}
-                      </span>
+              {/* Primary Report Card */}
+              <div className="details-hero-section">
+                <div className="details-title-row">
+                  <div>
+                    <h2 className="details-category-title">{detailReport.category}</h2>
+                    <div className="details-date-text">
+                      Submitted on {formatDate(detailReport.created_at)}
                     </div>
-                  )}
+                  </div>
+                  <span className={`status-badge ${getStatusClass(detailReport.status)}`}>
+                    {detailReport.status}
+                  </span>
                 </div>
-              </div>
 
-              <div className="details-desc-box">
-                <div className="details-info-label" style={{ marginBottom: '8px' }}>
-                  Citizen Description
+                {/* Verified Resolution Proof Banner (If Resolved & Proof Photo Exists) */}
+                {detailReport.status === 'Resolved' && detailReport.resolution_image_path ? (
+                  <div className="details-proof-banner">
+                    <div className="proof-title-bar">
+                      <span className="proof-title-text">
+                        Verified Municipal Resolution Evidence
+                      </span>
+                      {detailReport.resolved_at && (
+                        <span className="proof-resolved-time">
+                          Resolved on {formatDate(detailReport.resolved_at)}
+                        </span>
+                      )}
+                    </div>
+                    {detailReport.resolution_note && (
+                      <div className="proof-remarks-box">
+                        <strong>Completion Remarks:</strong> {detailReport.resolution_note}
+                      </div>
+                    )}
+                    <div className="proof-grid">
+                      <div>
+                        <div className="proof-col-heading">Before (Citizen Submission)</div>
+                        <img
+                          src={detailReport.image_path}
+                          alt="Before repair"
+                          className="proof-img-frame"
+                        />
+                      </div>
+                      <div>
+                        <div className="proof-col-heading">After (Authority Repair Proof)</div>
+                        <img
+                          src={detailReport.resolution_image_path}
+                          alt="After repair proof"
+                          className="proof-img-frame"
+                        />
+                      </div>
+                    </div>
+                  </div>
+                ) : detailReport.image_path ? (
+                  <img
+                    src={detailReport.image_path}
+                    alt={detailReport.category}
+                    className="details-image-banner"
+                  />
+                ) : (
+                  <div className="details-image-empty">
+                    No photographic evidence attached to this report
+                  </div>
+                )}
+
+                {/* Metadata Grid */}
+                <div className="details-meta-grid">
+                  <div className="details-meta-card">
+                    <div className="details-meta-label">Report ID</div>
+                    <div className="details-meta-val">#{detailReport.id}</div>
+                  </div>
+
+                  <div className="details-meta-card">
+                    <div className="details-meta-label">Date Submitted</div>
+                    <div className="details-meta-val">
+                      {formatDate(detailReport.created_at)}
+                    </div>
+                  </div>
+
+                  <div className="details-meta-card" style={{ gridColumn: '1 / -1' }}>
+                    <div className="details-meta-label">Location</div>
+                    <div className="details-meta-val">
+                      {detailReport.location_text}
+                    </div>
+                    {detailReport.latitude !== null && detailReport.longitude !== null && (
+                      <div style={{ marginTop: '8px' }}>
+                        <span className="coords-pill">
+                          GPS Coordinates: {detailReport.latitude}, {detailReport.longitude}
+                        </span>
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <div style={{ color: '#374151', fontSize: '14px', lineHeight: 1.6 }}>
-                  {detailReport.description
-                    ? detailReport.description
-                    : 'No additional description provided by the citizen.'}
+
+                <div className="details-desc-card">
+                  <div className="details-meta-label" style={{ marginBottom: '8px' }}>
+                    Citizen Description
+                  </div>
+                  <p className="details-desc-text">
+                    {detailReport.description
+                      ? detailReport.description
+                      : 'No additional description provided by the citizen.'}
+                  </p>
                 </div>
               </div>
 
               {/* Status Audit Timeline */}
-              <div className="timeline-section">
-                <h3 style={{ margin: '0 0 16px 0', fontSize: '16px' }}>Status Audit History</h3>
+              <div className="details-audit-section">
+                <h3 className="audit-section-title">Status Audit History</h3>
                 {detailReport.history && detailReport.history.length > 0 ? (
                   <div className="timeline">
                     {detailReport.history.map((h, idx) => {
@@ -478,37 +596,70 @@ function App() {
                             <span className="timeline-date">{formatDate(h.created_at)}</span>
                           </div>
                           {h.note && <div className="timeline-note">{h.note}</div>}
+                          {h.evidence_image_path && (
+                            <div style={{ marginTop: '6px' }}>
+                              <a
+                                href={h.evidence_image_path}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{ fontSize: '12px', color: 'var(--color-primary)', fontWeight: 600, textDecoration: 'underline' }}
+                              >
+                                View Attached Resolution Proof
+                              </a>
+                            </div>
+                          )}
                         </div>
                       )
                     })}
                   </div>
                 ) : (
-                  <p style={{ color: '#6b7280', fontSize: '13px' }}>No status changes recorded yet.</p>
+                  <p style={{ color: 'var(--color-text-muted)', fontSize: '13px' }}>No status changes recorded yet.</p>
                 )}
               </div>
 
               {/* Authority / Department Status Update Panel */}
-              <div className="authority-panel">
-                <div className="authority-title">
-                  <span>Department / Authority Review</span>
-                  <span className="authority-badge">Authority Action</span>
+              <div className="details-authority-card">
+                <div className="authority-card-header">
+                  <h3 className="authority-header-title">Department Review</h3>
+                  <span className="authority-header-badge">Authority Action</span>
                 </div>
 
                 {statusUpdateSuccess && (
-                  <div className="alert alert-success" style={{ padding: '8px 12px', fontSize: '13px' }}>
+                  <div className="alert alert-success" style={{ padding: '8px 12px', fontSize: '13px', marginBottom: '14px' }}>
                     {statusUpdateSuccess}
                   </div>
                 )}
 
                 {statusUpdateError && (
-                  <div className="alert alert-error" style={{ padding: '8px 12px', fontSize: '13px' }}>
+                  <div className="alert alert-error" style={{ padding: '8px 12px', fontSize: '13px', marginBottom: '14px' }}>
                     {statusUpdateError}
                   </div>
                 )}
 
-                {detailReport.allowed_transitions && detailReport.allowed_transitions.length > 0 ? (
+                {!currentUser ? (
+                  <div style={{ background: '#faf9f6', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid var(--color-border)', fontSize: '13px', color: 'var(--color-text-main)', lineHeight: 1.5 }}>
+                    <strong>Authentication Required:</strong> Please{' '}
+                    <button
+                      type="button"
+                      className="details-back-btn"
+                      style={{ padding: '4px 10px', fontSize: '12px', display: 'inline', margin: '0 6px' }}
+                      onClick={() => setActiveTab('auth')}
+                    >
+                      Sign In
+                    </button>{' '}
+                    with an approved Department Authority or Administrator account to update report statuses.
+                  </div>
+                ) : currentUser.role === 'citizen' ? (
+                  <div style={{ background: 'var(--color-accent-tint)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid #c7e0cf', fontSize: '13px', color: 'var(--color-primary)', lineHeight: 1.5 }}>
+                    <strong>Citizen Read-Only View:</strong> You are signed in as a citizen. Issue status transitions and audit notes can only be recorded by municipal officers.
+                  </div>
+                ) : currentUser.role === 'authority' && currentUser.account_status === 'pending_approval' ? (
+                  <div style={{ background: 'var(--color-danger-tint)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid #fecaca', fontSize: '13px', color: 'var(--color-danger)', lineHeight: 1.5 }}>
+                    <strong>Verification Pending:</strong> Your authority account is awaiting approval by the municipal administrator. Status updates are locked until your registration is verified.
+                  </div>
+                ) : detailReport.allowed_transitions && detailReport.allowed_transitions.length > 0 ? (
                   <form onSubmit={handleUpdateStatus}>
-                    <label style={{ fontSize: '13px', marginBottom: '8px' }}>
+                    <label style={{ fontSize: '13px', marginBottom: '8px', display: 'block', fontWeight: 600 }}>
                       Select Next Status:
                     </label>
                     <div className="transition-group">
@@ -525,35 +676,57 @@ function App() {
                       ))}
                     </div>
 
-                    <div className="form-group" style={{ marginBottom: '14px' }}>
-                      <label htmlFor="statusNote" style={{ fontSize: '13px' }}>
-                        Decision Note {selectedNextStatus === 'Rejected' ? <span className="req">* (Required)</span> : '(Optional)'}
-                      </label>
-                      <input
-                        type="text"
-                        id="statusNote"
-                        placeholder={
-                          selectedNextStatus === 'Rejected'
-                            ? 'Explain reason for rejection (min 5 chars)...'
-                            : 'Add an optional note (e.g. dispatched inspection team)...'
-                        }
-                        value={statusNote}
-                        onChange={(e) => setStatusNote(e.target.value)}
-                        disabled={updatingStatus}
-                      />
-                    </div>
+                    {selectedNextStatus === 'Resolved' ? (
+                      <div style={{ background: 'var(--color-success-tint)', padding: '16px', borderRadius: 'var(--radius-sm)', border: '1px solid #bbf7d0', marginBottom: '14px' }}>
+                        <p style={{ margin: '0 0 6px 0', fontSize: '13px', color: '#166534', fontWeight: 700 }}>
+                          Resolution Evidence Compulsory:
+                        </p>
+                        <p style={{ margin: '0 0 12px 0', fontSize: '12px', color: '#166534', lineHeight: 1.4 }}>
+                          Marking an issue as Resolved strictly requires photographic proof of the repair and a completion note.
+                        </p>
+                        <button
+                          type="button"
+                          className="report-success-btn-primary"
+                          onClick={() => setDetailResolutionModalOpen(true)}
+                          style={{ padding: '8px 16px', display: 'inline-block' }}
+                        >
+                          Attach Proof Photo and Resolve
+                        </button>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="form-group" style={{ marginBottom: '14px' }}>
+                          <label htmlFor="statusNote" style={{ fontSize: '13px', fontWeight: 600 }}>
+                            Decision Note {selectedNextStatus === 'Rejected' ? <span className="req">* (Required)</span> : '(Optional)'}
+                          </label>
+                          <input
+                            type="text"
+                            id="statusNote"
+                            className="report-input-text"
+                            placeholder={
+                              selectedNextStatus === 'Rejected'
+                                ? 'Explain reason for rejection (min 5 chars)...'
+                                : 'Add an optional note (e.g. dispatched inspection team)...'
+                            }
+                            value={statusNote}
+                            onChange={(e) => setStatusNote(e.target.value)}
+                            disabled={updatingStatus}
+                          />
+                        </div>
 
-                    <button
-                      type="submit"
-                      className="btn btn-primary"
-                      disabled={updatingStatus || !selectedNextStatus}
-                      style={{ width: 'auto', padding: '8px 16px' }}
-                    >
-                      {updatingStatus ? 'Updating...' : `Update Status to ${selectedNextStatus}`}
-                    </button>
+                        <button
+                          type="submit"
+                          className="report-submit-btn"
+                          disabled={updatingStatus || !selectedNextStatus}
+                          style={{ width: 'auto', padding: '10px 20px', marginTop: 0 }}
+                        >
+                          {updatingStatus ? 'Updating...' : `Update Status to ${selectedNextStatus}`}
+                        </button>
+                      </>
+                    )}
                   </form>
                 ) : (
-                  <p style={{ color: '#6b7280', fontSize: '13px', margin: 0 }}>
+                  <p style={{ color: 'var(--color-text-muted)', fontSize: '13px', margin: 0 }}>
                     No further transitions available from current status.
                   </p>
                 )}
@@ -561,10 +734,11 @@ function App() {
 
               <div style={{ marginTop: '24px' }}>
                 <button
-                  className="btn btn-secondary"
+                  type="button"
+                  className="details-back-btn"
                   onClick={() => setSelectedReportId(null)}
                 >
-                  ← Back to All Reports
+                  Back to Reports
                 </button>
               </div>
             </div>
@@ -572,28 +746,25 @@ function App() {
         </div>
       ) : activeTab === 'browse' ? (
         /* VIEW 2: Browse Reports List */
-        <div className="card">
-          <div
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              marginBottom: '16px',
-            }}
-          >
-            <h2 style={{ margin: 0, fontSize: '20px' }}>Civic Issues Feed</h2>
-            <span style={{ fontSize: '13px', color: '#6b7280' }}>
-              {reports.length} {reports.length === 1 ? 'report' : 'reports'} found
-            </span>
+        <div className="reports-feed-container">
+          <div className="reports-feed-header">
+            <div className="feed-header-main">
+              <h2 className="feed-title">Civic Issues Feed</h2>
+              <div className="feed-subtitle">Public municipal reports and infrastructure tracking</div>
+            </div>
+            <div className="feed-count-badge">
+              {reports.length} {reports.length === 1 ? 'report active' : 'reports active'}
+            </div>
           </div>
 
           {/* Filters Bar */}
-          <div className="filters-box">
-            <div className="filters-row">
+          <div className="feed-toolbar">
+            <div className="feed-toolbar-row">
               <div>
                 <input
                   type="text"
-                  placeholder="🔍 Search location or keywords..."
+                  className="feed-search-input"
+                  placeholder="Filter by keyword or location..."
                   value={filterSearch}
                   onChange={(e) => setFilterSearch(e.target.value)}
                 />
@@ -601,6 +772,7 @@ function App() {
 
               <div>
                 <select
+                  className="feed-filter-select"
                   value={filterCategory}
                   onChange={(e) => setFilterCategory(e.target.value)}
                 >
@@ -615,6 +787,7 @@ function App() {
 
               <div>
                 <select
+                  className="feed-filter-select"
                   value={filterStatus}
                   onChange={(e) => setFilterStatus(e.target.value)}
                 >
@@ -630,14 +803,24 @@ function App() {
               <div>
                 <button
                   type="button"
-                  className="btn btn-outline"
+                  className="feed-reset-btn"
                   onClick={handleClearFilters}
-                  title="Reset all filters"
                 >
-                  Clear Filters
+                  Reset Filters
                 </button>
               </div>
             </div>
+
+            {currentUser && (
+              <label className="feed-my-toggle">
+                <input
+                  type="checkbox"
+                  checked={myReportsOnly}
+                  onChange={(e) => setMyReportsOnly(e.target.checked)}
+                />
+                <span>Show only my submitted reports</span>
+              </label>
+            )}
           </div>
 
           {reportsError && (
@@ -654,26 +837,24 @@ function App() {
           )}
 
           {loadingReports ? (
-            <div className="empty-state">
-              <div className="empty-state-icon">⏳</div>
+            <div className="feed-empty">
               <h3>Loading civic reports...</h3>
             </div>
           ) : reports.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-state-icon">📋</div>
+            <div className="feed-empty">
               <h3>No civic reports found</h3>
               <p>
                 {filterCategory !== 'ALL' || filterStatus !== 'ALL' || filterSearch
-                  ? 'No reports match your selected filters. Try clearing the filters.'
-                  : 'Be the first resident to report a civic issue in your neighborhood!'}
+                  ? 'No reports match your selected filters. Try resetting the filters.'
+                  : 'No community issues have been reported yet in your area.'}
               </p>
               {filterCategory !== 'ALL' || filterStatus !== 'ALL' || filterSearch ? (
-                <button className="btn btn-secondary" onClick={handleClearFilters}>
-                  Clear Filters
+                <button className="feed-empty-btn" onClick={handleClearFilters}>
+                  Reset Filters
                 </button>
               ) : (
                 <button
-                  className="btn btn-primary"
+                  className="feed-empty-btn"
                   onClick={() => setActiveTab('report')}
                 >
                   Report an Issue
@@ -681,59 +862,51 @@ function App() {
               )}
             </div>
           ) : (
-            <div className="reports-grid">
+            <div className="feed-grid">
               {reports.map((r) => (
-                <div key={r.id} className="report-card">
+                <div key={r.id} className="feed-card">
                   {r.image_path ? (
                     <img
                       src={r.image_path}
                       alt={r.category}
-                      className="report-card-thumb"
+                      className="feed-card-media"
                     />
                   ) : (
-                    <div
-                      className="report-card-thumb"
-                      style={{
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        color: '#9ca3af',
-                        fontSize: '12px',
-                      }}
-                    >
-                      No photo
+                    <div className="feed-card-placeholder">
+                      No photo attached
                     </div>
                   )}
 
-                  <div className="report-card-content">
-                    <div className="report-card-badges">
-                      <span className="cat-badge">{r.category}</span>
+                  <div className="feed-card-body">
+                    <div className="feed-card-top">
+                      <div className="feed-card-category">{r.category}</div>
                       <span className={`status-badge ${getStatusClass(r.status)}`}>
                         {r.status}
                       </span>
                     </div>
 
-                    <div className="report-card-location">
-                      📍 {r.location_text}
+                    <div className="feed-card-location">
+                      {r.location_text}
                     </div>
 
-                    <div className="report-card-desc">
+                    <div className="feed-card-desc">
                       {r.description
-                        ? r.description.length > 80
-                          ? `${r.description.substring(0, 80)}...`
+                        ? r.description.length > 95
+                          ? `${r.description.substring(0, 95)}...`
                           : r.description
                         : 'No description provided.'}
                     </div>
 
-                    <div className="report-card-footer">
-                      <span className="report-card-date">
+                    <div className="feed-card-footer">
+                      <span className="feed-card-date">
                         {formatDate(r.created_at)}
                       </span>
                       <button
-                        className="btn btn-secondary"
+                        type="button"
+                        className="feed-card-btn"
                         onClick={() => setSelectedReportId(r.id)}
                       >
-                        View Details →
+                        View Details
                       </button>
                     </div>
                   </div>
@@ -742,194 +915,273 @@ function App() {
             </div>
           )}
         </div>
+      ) : activeTab === 'authority' &&
+        ((currentUser?.role === 'authority' && currentUser?.account_status === 'active') ||
+          currentUser?.role === 'admin') ? (
+        /* VIEW 3: Authority Operations Dashboard */
+        <AuthorityDashboard
+          token={token}
+          currentUser={currentUser}
+          onSelectReport={(id) => setSelectedReportId(id)}
+        />
+      ) : activeTab === 'admin' && currentUser?.role === 'admin' ? (
+        /* VIEW 4: Administrator Authority Approvals */
+        <AdminPanel token={token} />
+      ) : activeTab === 'map' ? (
+        /* VIEW 5: Interactive Map Explorer & Hotspots */
+        <CivicMapExplorer onSelectReport={(id) => setSelectedReportId(id)} />
       ) : (
-        /* VIEW 3: Report an Issue Form */
-        <div className="card">
+        /* VIEW 5: Report an Issue Form */
+        <div className="report-form-container">
+          <div className="report-form-header">
+            <h2 className="report-form-title">Report a Civic Issue</h2>
+            <div className="report-form-subtitle">
+              Submit neighborhood infrastructure concerns with coordinates and photo evidence for official review.
+            </div>
+          </div>
+
           {successReport ? (
-            <div className="alert alert-success">
-              <h3 style={{ margin: '0 0 8px 0' }}>Report Successfully Submitted!</h3>
-              <p style={{ margin: '0 0 10px 0' }}>
-                Your report has been securely saved and queued for municipal review.
+            <div className="report-success-card">
+              <h3 className="report-success-title">Report Successfully Submitted</h3>
+              <p className="report-success-desc">
+                Your report has been securely registered in the municipal database and queued for departmental triage.
               </p>
-              <div className="success-details">
-                <p>
-                  <strong>Report ID:</strong> #{successReport.id}
-                </p>
-                <p>
-                  <strong>Status:</strong>{' '}
-                  <span
-                    className={`status-badge ${getStatusClass(successReport.status)}`}
-                  >
-                    {successReport.status}
+              <div className="report-receipt-grid">
+                <div className="report-receipt-row">
+                  <span className="report-receipt-label">Report ID</span>
+                  <span className="report-receipt-value">#{successReport.id}</span>
+                </div>
+                <div className="report-receipt-row">
+                  <span className="report-receipt-label">Status</span>
+                  <span className="report-receipt-value">
+                    <span className={`status-badge ${getStatusClass(successReport.status)}`}>
+                      {successReport.status}
+                    </span>
                   </span>
-                </p>
-                <p>
-                  <strong>Category:</strong> {successReport.category}
-                </p>
-                <p>
-                  <strong>Location:</strong> {successReport.location_text}
-                </p>
+                </div>
+                <div className="report-receipt-row">
+                  <span className="report-receipt-label">Category</span>
+                  <span className="report-receipt-value">{successReport.category}</span>
+                </div>
+                <div className="report-receipt-row">
+                  <span className="report-receipt-label">Location</span>
+                  <span className="report-receipt-value">{successReport.location_text}</span>
+                </div>
                 {successReport.image_path && (
-                  <p>
-                    <strong>Attached Photo:</strong>{' '}
-                    <a
-                      href={successReport.image_path}
-                      target="_blank"
-                      rel="noreferrer"
-                      style={{ color: '#1a56db', textDecoration: 'underline' }}
-                    >
-                      View uploaded image
-                    </a>
-                  </p>
+                  <div className="report-receipt-row">
+                    <span className="report-receipt-label">Attached Photo</span>
+                    <span className="report-receipt-value">
+                      <a
+                        href={successReport.image_path}
+                        target="_blank"
+                        rel="noreferrer"
+                        style={{ color: 'var(--color-accent)', textDecoration: 'underline' }}
+                      >
+                        View uploaded evidence photo
+                      </a>
+                    </span>
+                  </div>
                 )}
               </div>
-              <div style={{ display: 'flex', gap: '12px', marginTop: '16px' }}>
+              <div className="report-success-actions">
                 <button
+                  type="button"
+                  className="report-success-btn-primary"
                   onClick={() => {
                     resetForm()
                     setSelectedReportId(successReport.id)
                   }}
-                  className="btn btn-primary"
-                  style={{ flex: 1 }}
                 >
                   View in Details
                 </button>
                 <button
+                  type="button"
+                  className="report-success-btn-secondary"
                   onClick={resetForm}
-                  className="btn btn-secondary"
-                  style={{ flex: 1 }}
                 >
                   Submit Another Report
                 </button>
               </div>
             </div>
           ) : (
-            <form onSubmit={handleSubmit}>
-              <h2 style={{ fontSize: '18px', marginTop: 0, marginBottom: '20px' }}>
-                Report a Civic Issue
-              </h2>
-
-              {submitError && (
-                <div className="alert alert-error">{submitError}</div>
-              )}
-
-              <div className="form-group">
-                <label htmlFor="category">
-                  Issue Category <span className="req">*</span>
-                </label>
-                <select
-                  id="category"
-                  value={category}
-                  onChange={(e) => setCategory(e.target.value)}
-                  disabled={submitting}
-                >
-                  {CATEGORIES.map((cat) => (
-                    <option key={cat} value={cat}>
-                      {cat}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="form-group">
-                <label htmlFor="photo">
-                  Attach Photo <span className="req">*</span>
-                </label>
-                <input
-                  type="file"
-                  id="photo"
-                  accept="image/jpeg,image/png,image/webp"
-                  onChange={handleImageChange}
-                  disabled={submitting}
-                  required
-                />
-                <p style={{ margin: '4px 0 0 0', fontSize: '12px', color: '#6b7280' }}>
-                  Compulsory: Photo is required for verification and AI model recognition (JPEG, PNG, WebP up to 5MB)
-                </p>
-
-                {imagePreview && (
-                  <div className="image-preview-wrapper">
-                    <img
-                      src={imagePreview}
-                      alt="Preview"
-                      className="image-preview"
-                    />
+            <div className="report-card-surface">
+              <form onSubmit={handleSubmit} className="report-form-body">
+                {!currentUser && (
+                  <div className="report-auth-notice">
+                    <div className="report-auth-notice-text">
+                      <strong>Citizen Sign-In Required:</strong> Community issue reporting requires an active citizen or administrator account to maintain neighborhood accountability and transparency.
+                    </div>
                     <button
                       type="button"
-                      className="btn-remove-img"
-                      onClick={handleRemoveImage}
+                      className="report-auth-btn"
+                      onClick={() => setActiveTab('auth')}
                     >
-                      ✕ Remove
+                      Sign In / Register
                     </button>
                   </div>
                 )}
-              </div>
 
-              <div className="form-group">
-                <label htmlFor="location">
-                  Location Details <span className="req">*</span>
-                </label>
-                <input
-                  type="text"
-                  id="location"
-                  placeholder="e.g. Near Market Gate #2, 5th Cross Road"
-                  value={locationText}
-                  onChange={(e) => setLocationText(e.target.value)}
-                  disabled={submitting}
-                  required
-                />
-                <div className="location-actions">
-                  <button
-                    type="button"
-                    className="btn btn-secondary"
-                    onClick={handleDetectLocation}
-                    disabled={submitting || geoLoading}
+                {submitError && (
+                  <div className="alert alert-error">{submitError}</div>
+                )}
+
+                <div className="report-field-group">
+                  <label htmlFor="category" className="report-field-label">
+                    Issue Category <span className="report-field-req">*</span>
+                  </label>
+                  <select
+                    id="category"
+                    className="report-input-select"
+                    value={category}
+                    onChange={(e) => setCategory(e.target.value)}
+                    disabled={submitting}
                   >
-                    {geoLoading ? 'Detecting GPS...' : '📍 Detect My Location'}
-                  </button>
-                  {latitude !== null && longitude !== null && (
-                    <span className="coords-pill">
-                      Lat: {latitude}, Lng: {longitude}
-                    </span>
+                    {CATEGORIES.map((cat) => (
+                      <option key={cat} value={cat}>
+                        {cat}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div className="report-field-group">
+                  <label htmlFor="photo" className="report-field-label">
+                    Photographic Evidence <span className="report-field-req">*</span>
+                  </label>
+                  <div className="report-file-control">
+                    <input
+                      type="file"
+                      id="photo"
+                      accept="image/jpeg,image/png,image/webp"
+                      onChange={handleImageChange}
+                      disabled={submitting}
+                      required
+                    />
+                    <div className="report-field-hint">
+                      Compulsory: Clear photo evidence is required for automated review and municipal validation (JPEG, PNG, WebP up to 5MB).
+                    </div>
+                  </div>
+
+                  {imagePreview && (
+                    <div className="report-preview-container">
+                      <img
+                        src={imagePreview}
+                        alt="Preview"
+                        className="report-preview-image"
+                      />
+                      <button
+                        type="button"
+                        className="report-remove-photo-btn"
+                        onClick={handleRemoveImage}
+                      >
+                        Remove Photo
+                      </button>
+                    </div>
                   )}
                 </div>
-                {geoError && (
-                  <div style={{ color: '#d73a49', fontSize: '12px', marginTop: '4px' }}>
-                    {geoError}
+
+                <div className="report-field-group">
+                  <label htmlFor="location" className="report-field-label">
+                    Location Details <span className="report-field-req">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    id="location"
+                    className="report-input-text"
+                    placeholder="e.g. Near Market Gate 2, 5th Cross Road"
+                    value={locationText}
+                    onChange={(e) => setLocationText(e.target.value)}
+                    disabled={submitting}
+                    required
+                  />
+
+                  <div className="report-geo-actions">
+                    <button
+                      type="button"
+                      className="report-detect-btn"
+                      onClick={handleDetectLocation}
+                      disabled={submitting || geoLoading}
+                    >
+                      {geoLoading ? 'Detecting GPS...' : 'Detect My Location'}
+                    </button>
+                    {latitude !== null && longitude !== null && (
+                      <span className="report-coords-badge">
+                        GPS: {latitude}, {longitude}
+                      </span>
+                    )}
                   </div>
-                )}
-              </div>
 
-              <div className="form-group">
-                <label htmlFor="description">Description (Optional)</label>
-                <textarea
-                  id="description"
-                  rows="4"
-                  placeholder="Describe the problem, severity, and any hazards (optional)..."
-                  value={description}
-                  maxLength={2000}
-                  onChange={(e) => setDescription(e.target.value)}
-                  disabled={submitting}
-                />
-                <div className="char-counter">
-                  {description.length} / 2000 characters
+                  {geoError && (
+                    <div style={{ color: 'var(--color-danger)', fontSize: '12px', marginTop: '4px' }}>
+                      {geoError}
+                    </div>
+                  )}
+
+                  <div style={{ marginTop: '12px' }}>
+                    <LocationPickerMap
+                      latitude={latitude}
+                      longitude={longitude}
+                      onChange={({ lat, lng }) => {
+                        setLatitude(lat)
+                        setLongitude(lng)
+                      }}
+                    />
+                  </div>
                 </div>
-              </div>
 
-              <button
-                type="submit"
-                className="btn btn-primary"
-                style={{ width: '100%' }}
-                disabled={submitting}
-              >
-                {submitting ? 'Submitting Report...' : 'Submit Report'}
-              </button>
-            </form>
+                <div className="report-field-group">
+                  <label htmlFor="description" className="report-field-label">
+                    Detailed Description (Optional)
+                  </label>
+                  <textarea
+                    id="description"
+                    className="report-input-textarea"
+                    rows="4"
+                    placeholder="Describe the issue severity, hazards, or landmarks (optional)..."
+                    value={description}
+                    maxLength={2000}
+                    onChange={(e) => setDescription(e.target.value)}
+                    disabled={submitting}
+                  />
+                  <div className="char-counter">
+                    {description.length} / 2000 characters
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  className="report-submit-btn"
+                  disabled={submitting}
+                >
+                  {submitting ? 'Submitting Report...' : 'Submit Report'}
+                </button>
+              </form>
+            </div>
           )}
         </div>
       )}
+
+      {/* Resolution Evidence Modal for Details View */}
+      {detailResolutionModalOpen && detailReport && (
+        <ResolutionEvidenceModal
+          isOpen={detailResolutionModalOpen}
+          report={detailReport}
+          token={token}
+          onClose={() => setDetailResolutionModalOpen(false)}
+          onSuccess={(updated) => {
+            setDetailReport(updated)
+            setSelectedNextStatus(updated.allowed_transitions?.[0] || '')
+            setStatusNote('')
+            setStatusUpdateSuccess('Report verified and resolved with resolution proof!')
+            fetchReports()
+          }}
+        />
+      )}
+        </main>
+      </div>
     </div>
   )
 }
 
 export default App
+
